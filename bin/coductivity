@@ -68,7 +68,10 @@ def getAuthorMap(options):
 
 def calculateOverallContributions(commitLog):
     rval = ""
-    author = {"author": commitLog[0]["author"]}
+    
+    print commitLog 
+    
+    author = commitLog[0]["author"]
     languages = {}
     
     for commit in commitLog:
@@ -157,7 +160,7 @@ def main():
     names.sort(sorter)
 
     for n in names:
-        print calculateContributions(authors[n])
+        print calculateOverallContributions(authors[n])
 
 if __name__ == "__main__":
     main()
