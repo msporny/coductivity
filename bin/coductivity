@@ -1,0 +1,164 @@
+#!/usr/bin/env python
+'''
+Coductivity takes one or more git repositories as input and produces a number
+of graphs showing code productivity over time for a group as well as per-person
+productivity over time. WARNING: This tool should never be used by itself to
+determine whether or not a company or individual is being productive - code
+output is just one small measure of a person's influence on the whole health
+of a project.
+'''
+import sys
+import os
+import subprocess
+import tempfile
+import time
+from StringIO import StringIO
+from optparse import OptionParser
+from dulwich.repo import Repo
+from dulwich.patch import write_tree_diff
+
+USAGE = """%prog GIT_REPOSITORY GIT_REPOSITORY ...
+
+%prog Performs code productivity analysis on the given GIT repository.
+
+************** %prog command line options **************
+"""
+
+def _get_options():
+    """
+    Get options from command line and return them.
+    """
+
+    parser = OptionParser(usage=USAGE)
+    parser.add_option(
+        "--cache-dir", action="store", default="/tmp/coductivity-cache",
+        help="The cache directory that will contain all git repositories " +
+        "being analyzed." 
+        "[Default: %default]")
+    parser.add_option(
+        "-o", "--out_dir", action="store", default=None,
+        help="If specified, creates a web-publishable directory containing " +
+        "the result of the coductivity run." 
+        "[Default: %default]")
+    parser.add_option(
+        "-a", "--author-map", action="store", default=None,
+        help="A colon-separated map of alias accounts to real accounts. " +
+        "The map can be used to assign multiple e-mail accounts to one account." 
+        "[Default: %default]")
+    options, args = parser.parse_args()
+    options.args = args
+
+    return options
+
+def getAuthorMap(options):
+    """
+    Uses the options.author_map variable to read a file with author mappings
+    in it and use those to combine commits made by a single author with 
+    multiple e-mail accounts to a single e-mail account.
+    """
+    rval = {}
+    
+    if(os.path.exists(options.author_map)):
+        authorFile = open(options.author_map, "r")
+        for line in authorFile:
+            (alias, email) = line.strip().split(":")
+            rval[alias.strip()] = email.strip()
+        
+    return rval
+
+def calculateOverallContributions(commitLog):
+    rval = ""
+    author = {"author": commitLog[0]["author"]}
+    languages = {}
+    
+    for commit in commitLog:
+        lkeys = commit.keys()
+        lkeys.remove("author")
+        lkeys.remove("date")
+        for l in lkeys:
+            languages[l] = languages.get(l, 0) + commit[l]
+
+    rval = "Contributor: %s\n" % (author,)
+
+    for l in languages:
+        rval += "    %s: %i" (l, l["sloc"])
+
+def main():
+    """
+    The main entry point for the script.
+    """
+    options = _get_options()
+
+    # Check to make sure at least the project directory was specified
+    if(len(options.args) < 1):
+        print "ERROR: You must specify at least one project directory."
+        sys.exit(1)
+
+    author_map = getAuthorMap(options)
+    authors = {}
+
+    # Assume each command-line parameter that is not an option is a path to
+    # a git repository
+    for repository in options.args:
+        repo = Repo(repository)
+        history = repo.revision_history(repo.head())
+
+        lastCommit = None
+        for revision in history:
+        
+            # map the aliases for the author correctly
+            author = revision.author
+            if(author_map.has_key(author)):
+                author = author_map[author]
+            
+            # retrieve the coductivity commit list, or create a new one
+            authors[author] = authors.get(author, [])
+            commit = {"author": author}
+            commit["date"] = revision.commit_time
+
+            if(lastCommit):
+                print "Diffing: ", lastCommit.id, "to",  revision.id
+                diff = StringIO()
+                write_tree_diff(
+                    diff, repo.object_store, lastCommit.tree, revision.tree)
+                diff.seek(0)
+                
+                # Keep track of the active file type and whether or not
+                # changes should be ignored
+                activeFileType = None
+                ignoreLine = False
+                
+                # This loop does several things - it attempts to identify the
+                # file type by the extension, counts file modifications,
+                # and ignores files that are deleted. These stats are captured
+                # in a commit object and added to the author dictionary
+                for line in diff:
+                    if(line.startswith("---")):
+                        if(line.startswith("--- /dev/null")):
+                            activeFileType = None
+                        else:
+                            activeFileType = line.split(".")[-1].strip()
+                        ignoreLine = False
+                    elif(line.startswith("---")):
+                        if(line.startswith("+++ /dev/null")):
+                            # don't count file deletions as modified lines
+                            ignoreLine = True
+                        elif(not activeFileType):
+                            activeFileType = line.split(".")[-1].strip()
+                    elif(not ignoreLine and 
+                        (line.startswith("-") or line.startswith("+"))):
+                        commit[activeFileType] = commit.get(activeFileType, 0) + 1
+                authors[author].append(commit)
+            lastCommit = revision
+
+    names = authors.keys()
+    def sorter(a, b):
+        return cmp(authors[b], authors[a])
+    names.sort(sorter)
+
+    for n in names:
+        print calculateContributions(authors[n])
+
+if __name__ == "__main__":
+    main()
+
