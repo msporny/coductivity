@@ -14,6 +14,7 @@ import subprocess
 import shutil
 import tempfile
 import time
+import datetime
 from StringIO import StringIO
 from optparse import OptionParser
 from dulwich.objects import Commit, Tree
@@ -187,13 +188,34 @@ def generateJavaScriptData(authors, options):
             datedCommitTotals[date] = datedCommitTotals.get(date, 0) + \
                 c["totalChanges"]
 
+    # Inject zero-ed commit totals at the beginning of each month
+    currentDate = datetime.date.fromtimestamp(sortedDates[0])
+    endDate = datetime.date.fromtimestamp(sortedDates[-1])
+    oneMonth = datetime.timedelta(weeks=4)
+    while(currentDate < endDate):
+        currentDate += oneMonth
+        secsInYear = 31556926
+        secsInMonth = 2629743
+        secondsSince1970 = (currentDate.year * secsInYear) + \
+            (currentDate.month * secsInMonth)
+        datedCommitTotals[secondsSince1970] = 0
+
     # Generate the JavaScript data file contents
     rval = "var start = new Date(%s);\n" % (sortedDates[0] * 1000,)
     rval += "var data = [\n"
     modifiedLines = 0
+    currentTime = datetime.date.fromtimestamp(sortedDates[0])
     for date in sortedDates:
+        commitTime = datetime.date.fromtimestamp(date)
+        
+        # Generate a saw-tooth area graph that resets the total number of
+        # lines modified after each month
+        if(currentTime.month != commitTime.month):
+            currentTime = commitTime
+            modifiedLines = 0
         modifiedLines += datedCommitTotals[date]
         rval += "   {x: %s, y: %s},\n" % (date * 1000, modifiedLines)
+
     rval += "];\n"
     rval += "var end = new Date(%s);\n" % (sortedDates[-1] * 1000,)
     
@@ -238,7 +260,8 @@ def main():
 
             # dump a bit of status so that the developer knows that we're
             # workin' it
-            print reponame, revision.commit_time, revision.id
+            commitTime = datetime.date.fromtimestamp(revision.commit_time)
+            print reponame, commitTime, revision.id
 
             if(lastCommit):
                 calculateDiff(repo, revision, commit, lastCommit)
