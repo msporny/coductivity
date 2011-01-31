@@ -14,6 +14,7 @@ import tempfile
 import time
 from StringIO import StringIO
 from optparse import OptionParser
+from dulwich.objects import Commit, Tree
 from dulwich.repo import Repo
 from dulwich.patch import write_tree_diff
 
@@ -34,6 +35,13 @@ def _get_options():
         "--cache-dir", action="store", default="/tmp/coductivity-cache",
         help="The cache directory that will contain all git repositories " +
         "being analyzed." 
+        "[Default: %default]")
+    parser.add_option(
+        "-l", "--language", action="append", default=
+        ["c", "h", "i", "cpp", "js", "html", "tpl", "in", "ac", "py", "java"],
+        help="Add the language in the list of languages to summarize. " +
+        "This option may be used multiple times - for example, " +
+        "-l cpp -l h -l py"
         "[Default: %default]")
     parser.add_option(
         "-o", "--out_dir", action="store", default=None,
@@ -66,25 +74,30 @@ def getAuthorMap(options):
         
     return rval
 
-def calculateOverallContributions(commitLog):
+def calculateOverallContributions(author, commitLog, options):
     rval = ""
-    
-    print commitLog 
-    
-    author = commitLog[0]["author"]
     languages = {}
     
     for commit in commitLog:
         lkeys = commit.keys()
         lkeys.remove("author")
         lkeys.remove("date")
+        
         for l in lkeys:
             languages[l] = languages.get(l, 0) + commit[l]
 
     rval = "Contributor: %s\n" % (author,)
 
-    for l in languages:
-        rval += "    %s: %i" (l, l["sloc"])
+    # Determine if the language list should be filtered down
+    lkeys = languages.keys()
+    if(len(options.language) > 0):
+        lkeys = options.language
+        
+    for k in lkeys:
+        if(k in languages.keys()):
+            rval += "    %s: %i\n" % (k, languages[k])
+
+    return rval
 
 def main():
     """
@@ -103,6 +116,7 @@ def main():
     # Assume each command-line parameter that is not an option is a path to
     # a git repository
     for repository in options.args:
+        reponame = repository.split("/")[-1]
         repo = Repo(repository)
         history = repo.revision_history(repo.head())
 
@@ -120,7 +134,7 @@ def main():
             commit["date"] = revision.commit_time
 
             if(lastCommit):
-                print "Diffing: ", lastCommit.id, "to",  revision.id
+                print reponame, revision.commit_time, revision.id
                 diff = StringIO()
                 write_tree_diff(
                     diff, repo.object_store, lastCommit.tree, revision.tree)
@@ -128,6 +142,7 @@ def main():
                 
                 # Keep track of the active file type and whether or not
                 # changes should be ignored
+                totalChanges = 0
                 activeFileType = None
                 ignoreLine = False
                 
@@ -136,11 +151,19 @@ def main():
                 # and ignores files that are deleted. These stats are captured
                 # in a commit object and added to the author dictionary
                 for line in diff:
+                
+                    # determine the active file type and whether or not the
+                    # line should be ignored
                     if(line.startswith("---")):
                         if(line.startswith("--- /dev/null")):
                             activeFileType = None
                         else:
                             activeFileType = line.split(".")[-1].strip()
+                            if(activeFileType.startswith("---")):
+                                print "WARNING: Ignoring unknown file type %s" % \
+                                    (activeFileType,)
+                                activeFileType = None
+                                ignoreLine = True
                         ignoreLine = False
                     elif(line.startswith("---")):
                         if(line.startswith("+++ /dev/null")):
@@ -148,10 +171,24 @@ def main():
                             ignoreLine = True
                         elif(not activeFileType):
                             activeFileType = line.split(".")[-1].strip()
-                    elif(not ignoreLine and 
+                            if(activeFileType.startswith("---")):
+                                print "WARNING: Ignoring unknown file type %s" % \
+                                    (activeFileType,)
+                                activeFileType = None
+                                ignoreLine = True
+
+                    # Record the modification if there is an active file type
+                    # and the line should not be ignored, and the line starts
+                    # with a '+' or a '-'
+                    if(activeFileType and not ignoreLine and 
                         (line.startswith("-") or line.startswith("+"))):
                         commit[activeFileType] = commit.get(activeFileType, 0) + 1
-                authors[author].append(commit)
+                        totalChanges += 1
+                        
+                # Do not add a commit that has more than 1000 total changes because
+                # it is most likely just a global search/replace for text
+                if(totalChanges < 1000):
+                    authors[author].append(commit)
             lastCommit = revision
 
     names = authors.keys()
@@ -160,7 +197,7 @@ def main():
     names.sort(sorter)
 
     for n in names:
-        print calculateOverallContributions(authors[n])
+        print calculateOverallContributions(n, authors[n], options)
 
 if __name__ == "__main__":
     main()
