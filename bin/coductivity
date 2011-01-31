@@ -1,15 +1,17 @@
 #!/usr/bin/env python
-'''
+"""
 Coductivity takes one or more git repositories as input and produces a number
 of graphs showing code productivity over time for a group as well as per-person
 productivity over time. WARNING: This tool should never be used by itself to
 determine whether or not a company or individual is being productive - code
 output is just one small measure of a person's influence on the whole health
 of a project.
-'''
+"""
 import sys
 import os
+import os.path
 import subprocess
+import shutil
 import tempfile
 import time
 from StringIO import StringIO
@@ -38,7 +40,8 @@ def _get_options():
         "[Default: %default]")
     parser.add_option(
         "-l", "--language", action="append", default=
-        ["c", "h", "i", "cpp", "js", "html", "tpl", "in", "ac", "py", "java"],
+        ["c", "h", "i", "cpp", "js", "html", "tpl", "in", "ac", "py", "java", 
+         "php", "inc"],
         help="Add the language in the list of languages to summarize. " +
         "This option may be used multiple times - for example, " +
         "-l cpp -l h -l py"
@@ -75,29 +78,126 @@ def getAuthorMap(options):
     return rval
 
 def calculateOverallContributions(author, commitLog, options):
+    """
+    Calculates the overall contributions made by the given committer and 
+    generates a string that is easy to read.
+    """
     rval = ""
     languages = {}
     
+    # process all of the commits, adding up the code line modification totals
     for commit in commitLog:
         lkeys = commit.keys()
         lkeys.remove("author")
         lkeys.remove("date")
+        lkeys.remove("totalChanges")
         
         for l in lkeys:
             languages[l] = languages.get(l, 0) + commit[l]
 
     rval = "Contributor: %s\n" % (author,)
 
-    # Determine if the language list should be filtered down
+    # determine if the language list should be filtered down
     lkeys = languages.keys()
     if(len(options.language) > 0):
         lkeys = options.language
-        
+
+    # gather all of the languages that have been marked as being important        
     for k in lkeys:
         if(k in languages.keys()):
             rval += "    %s: %i\n" % (k, languages[k])
 
     return rval
+
+def calculateDiff(repo, revision, commit, lastCommit):
+    """
+    Calculates a diff between two revisions in a git revision history and 
+    records the value in the given 'commit' object.
+    """
+    diff = StringIO()
+
+    # Generate the diff
+    write_tree_diff(diff, repo.object_store, lastCommit.tree, revision.tree)
+    diff.seek(0)
+    
+    # Keep track of the active file type and whether or not
+    # changes should be ignored
+    activeFileType = None
+    ignoreLine = False
+    
+    # This loop does several things - it attempts to identify the
+    # file type by the extension, counts file modifications,
+    # and ignores files that are deleted. These stats are captured
+    # in a commit object and added to the author dictionary
+    for line in diff:
+        # determine the active file type and whether or not the
+        # line should be ignored
+        if(line.startswith("---")):
+            if(line.startswith("--- /dev/null")):
+                activeFileType = None
+            else:
+                activeFileType = line.split(".")[-1].strip()
+                if(activeFileType.startswith("---")):
+                    print "WARNING: Ignoring unknown file type %s" % \
+                        (activeFileType,)
+                    activeFileType = None
+                    ignoreLine = True
+            ignoreLine = False
+        elif(line.startswith("---")):
+            if(line.startswith("+++ /dev/null")):
+                # don't count file deletions as modified lines
+                ignoreLine = True
+            elif(not activeFileType):
+                activeFileType = line.split(".")[-1].strip()
+                if(activeFileType.startswith("---")):
+                    print "WARNING: Ignoring unknown file type %s" % \
+                        (activeFileType,)
+                    activeFileType = None
+                    ignoreLine = True
+
+        # Record the modification if there is an active file type
+        # and the line should not be ignored, and the line starts
+        # with a '+' or a '-'
+        if(activeFileType and not ignoreLine and 
+            (line.startswith("-") or line.startswith("+"))):
+            commit[activeFileType] = commit.get(activeFileType, 0) + 1
+            commit["totalChanges"] = commit.get("totalChanges", 0) + 1
+
+def generateJavaScriptData(authors, options):
+    """
+    Generates a set of Protovis JavaScript code that can be used to visualize
+    overall developer throughput.
+    """
+    rval = ""
+    allCommits = {}
+    datedCommitTotals = {}
+    
+    for author in authors.keys():
+        for c in authors[author]:
+            # FIXME: This should be binned to a single work-day
+            commitArray = allCommits.get(c["date"], [])
+            commitArray.append(c)
+            allCommits[c["date"]] = commitArray
+
+    sortedDates = allCommits.keys()
+    sortedDates.sort()
+
+    for date in sortedDates:
+        for c in allCommits[date]:
+            datedCommitTotals[date] = datedCommitTotals.get(date, 0) + \
+                c["totalChanges"]
+
+    # Generate the JavaScript data file contents
+    rval = "var start = new Date(%s);\n" % (sortedDates[0] * 1000,)
+    rval += "var data = [\n"
+    modifiedLines = 0
+    for date in sortedDates:
+        modifiedLines += datedCommitTotals[date]
+        rval += "   {x: %s, y: %s},\n" % (date * 1000, modifiedLines)
+    rval += "];\n"
+    rval += "var end = new Date(%s);\n" % (sortedDates[-1] * 1000,)
+    
+    return rval;
 
 def main():
     """
@@ -120,9 +220,9 @@ def main():
         repo = Repo(repository)
         history = repo.revision_history(repo.head())
 
+        # process all of the commits reachable via git HEAD
         lastCommit = None
         for revision in history:
-        
             # map the aliases for the author correctly
             author = revision.author
             if(author_map.has_key(author)):
@@ -130,74 +230,53 @@ def main():
             
             # retrieve the coductivity commit list, or create a new one
             authors[author] = authors.get(author, [])
+            
+            # create the new commit tracking object
             commit = {"author": author}
             commit["date"] = revision.commit_time
+            commit["totalChanges"] = 0
+
+            # dump a bit of status so that the developer knows that we're
+            # workin' it
+            print reponame, revision.commit_time, revision.id
 
             if(lastCommit):
-                print reponame, revision.commit_time, revision.id
-                diff = StringIO()
-                write_tree_diff(
-                    diff, repo.object_store, lastCommit.tree, revision.tree)
-                diff.seek(0)
-                
-                # Keep track of the active file type and whether or not
-                # changes should be ignored
-                totalChanges = 0
-                activeFileType = None
-                ignoreLine = False
-                
-                # This loop does several things - it attempts to identify the
-                # file type by the extension, counts file modifications,
-                # and ignores files that are deleted. These stats are captured
-                # in a commit object and added to the author dictionary
-                for line in diff:
-                
-                    # determine the active file type and whether or not the
-                    # line should be ignored
-                    if(line.startswith("---")):
-                        if(line.startswith("--- /dev/null")):
-                            activeFileType = None
-                        else:
-                            activeFileType = line.split(".")[-1].strip()
-                            if(activeFileType.startswith("---")):
-                                print "WARNING: Ignoring unknown file type %s" % \
-                                    (activeFileType,)
-                                activeFileType = None
-                                ignoreLine = True
-                        ignoreLine = False
-                    elif(line.startswith("---")):
-                        if(line.startswith("+++ /dev/null")):
-                            # don't count file deletions as modified lines
-                            ignoreLine = True
-                        elif(not activeFileType):
-                            activeFileType = line.split(".")[-1].strip()
-                            if(activeFileType.startswith("---")):
-                                print "WARNING: Ignoring unknown file type %s" % \
-                                    (activeFileType,)
-                                activeFileType = None
-                                ignoreLine = True
-
-                    # Record the modification if there is an active file type
-                    # and the line should not be ignored, and the line starts
-                    # with a '+' or a '-'
-                    if(activeFileType and not ignoreLine and 
-                        (line.startswith("-") or line.startswith("+"))):
-                        commit[activeFileType] = commit.get(activeFileType, 0) + 1
-                        totalChanges += 1
-                        
+                calculateDiff(repo, revision, commit, lastCommit)
                 # Do not add a commit that has more than 1000 total changes because
                 # it is most likely just a global search/replace for text
-                if(totalChanges < 1000):
+                if(commit["totalChanges"] < 1000):
                     authors[author].append(commit)
             lastCommit = revision
 
-    names = authors.keys()
-    def sorter(a, b):
-        return cmp(authors[b], authors[a])
-    names.sort(sorter)
+    if(not options.out_dir):
+        # if there isn't an output directory, dump some summary info to stdout
+        names = authors.keys()
+        def sorter(a, b):
+            return cmp(authors[b], authors[a])
+        names.sort(sorter)
 
-    for n in names:
-        print calculateOverallContributions(n, authors[n], options)
+        for n in names:
+            print calculateOverallContributions(n, authors[n], options)
+    else:
+        # if an output directory exists, generate a web page
+        dataJavaScript = generateJavaScriptData(authors, options)
+        dataFilename = os.path.join(options.out_dir, "data.js")
+        
+        # Create the web directory
+        if(not os.path.exists(options.out_dir)):
+            os.makedirs(options.out_dir)
+        
+        # Copy all of the helper files over
+        files = ["coductivity.css", "coductivity.js", "index.html", 
+            "protovis-r3.2.js"]
+
+        for f in files:
+            shutil.copyfile(os.path.join("web", f), 
+                os.path.join(options.out_dir, f))
+
+        data = open(dataFilename, "w")
+        data.write(dataJavaScript)
+        data.close()
 
 if __name__ == "__main__":
     main()

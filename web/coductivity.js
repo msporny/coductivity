@@ -9,8 +9,8 @@
    coductivity.plot = function()
    {
       /* Scales and sizing. */
-      var w = 810,
-          h1 = 300,
+      var w = 1024,
+          h1 = 500,
           h2 = 30,
           x = pv.Scale.linear(start, end).range(0, w),
           y = pv.Scale.linear(0, pv.max(data, function(d) { return d.y; })).range(0, h2);
