@@ -6,14 +6,38 @@
    // local alias for use by applications
    var coductivity = window.coductivity;
 
-   coductivity.plot = function()
+   /**
+    * Plots all of the committers on record.
+    */
+   coductivity.plotAll = function()
+   {
+      $("#graphs").append("<h1>All Productivity</h1><div id=\"all\"></div>");
+      coductivity.plot("all");
+
+      for(var key in data)
+      {
+         if(key != "all")
+         {
+            $("#graphs").append("<h1>" + key + "</h1>" +
+               "<div id=\"" + key + "\"></div>");
+            coductivity.plot(key);
+         }
+      }
+   }
+
+   /**
+    * Plots a particular committer 
+    */
+   coductivity.plot = function(committer)
    {
       /* Scales and sizing. */
+      var cdata = data[committer]
       var w = 1024,
           h1 = 500,
           h2 = 30,
           x = pv.Scale.linear(start, end).range(0, w),
-          y = pv.Scale.linear(0, pv.max(data, function(d) { return d.y; })).range(0, h2);
+          y = pv.Scale.linear(0, 
+             pv.max(cdata, function(d) { return d.y; })).range(0, h2);
 
       /* Interaction state. Focus scales will have domain set on-render. */
       var i = {x:200, dx:100},
@@ -21,11 +45,13 @@
           fy = pv.Scale.linear().range(0, h1);
 
       /* Root panel. */
+      console.log("Plotting", committer);
       var vis = new pv.Panel()
+          .canvas(committer)
           .width(w)
           .height(h1 + 20 + h2)
           .bottom(20)
-          .left(30)
+          .left(50)
           .right(20)
           .top(5);
 
@@ -34,9 +60,9 @@
           .def("init", function() {
               var d1 = x.invert(i.x),
                   d2 = x.invert(i.x + i.dx),
-                  dd = data.slice(
-                      Math.max(0, pv.search.index(data, d1, function(d) { return d.x; }) - 1),
-                      pv.search.index(data, d2, function(d) { return d.x; }) + 1);
+                  dd = cdata.slice(
+                      Math.max(0, pv.search.index(cdata, d1, function(d) { return d.x; }) - 1),
+                      pv.search.index(cdata, d2, function(d) { return d.x; }) + 1);
               fx.domain(d1, d2);
               fy.domain(y.domain());
               return dd;
@@ -54,7 +80,7 @@
 
       /* Y-axis ticks. */
       focus.add(pv.Rule)
-          .data(function() { return fy.ticks(7); })
+          .data(function() { return fy.ticks(10); })
           .bottom(fy)
           .strokeStyle(function(d) { return d ? "#aaa" : "#000"; })
         .anchor("left").add(pv.Label)
@@ -93,7 +119,7 @@
 
       /* Context area chart. */
       context.add(pv.Area)
-          .data(data)
+          .data(cdata)
           .left(function(d) { return x(d.x); })
           .bottom(1)
           .height(function(d) { return y(d.y); })

@@ -45,8 +45,8 @@ def _get_options():
         "cache. [Default: %default]")
     parser.add_option(
         "-l", "--language", action="append", default=
-        ["c", "h", "i", "cpp", "js", "html", "tpl", "in", "ac", "py", "java", 
-         "php", "inc"],
+        ["c", "h", "i", "cpp", "js", "html", "css", "tpl", "in", "ac", "py", 
+        "java", "php", "inc"],
         help="Add the language in the list of languages to summarize. "
         "This option may be used multiple times - for example, "
         "-l cpp -l h -l py [Default: %default]")
@@ -61,6 +61,13 @@ def _get_options():
         " [Default: %default]")
     options, args = parser.parse_args()
     options.args = args
+
+    options.complexity = {"c": 1.0, "h": 0.8, "i": 1.2, "cpp": 1.0, 
+       "js": 0.8, "html": 0.4, "css": 0.8, "tpl": 0.5, "in": 1.2, "ac": 1.2, 
+       "py": 0.8, "java": 0.9, "php": 0.8, "inc": 0.8}
+    #options.complexity = {"c": 1.0, "h": 1.0, "i": 1.0, "cpp": 1.0, 
+    #   "js": 1.0, "html": 1.0, "tpl": 1.0, "css": 1.0, "in": 1.0, "ac": 1.0, 
+    #   "py": 1.0, "java": 1.0, "php": 1.0, "inc": 1.0}
 
     return options
 
@@ -179,61 +186,91 @@ def calculateDiff(repo, revision, commit, lastCommit):
             commit[activeFileType] = commit.get(activeFileType, 0) + 1
             commit["totalChanges"] = commit.get("totalChanges", 0) + 1
 
-def generateJavaScriptData(authors, options):
+def getTimestamp(dt):
+    """
+    Converts a Python datetime object into a POSIX-compatible 1970-based epoch 
+    timestamp.
+    """
+    return int(time.mktime(dt.timetuple()))
+
+def getCommitTotals(c, startDate, endDate, author = None):
+    rval = {}
+    
+    # Calculate the date changes
+    oneDay = datetime.timedelta(1)
+    currentDate = startDate
+    currentMonth = startDate.month
+    changes = 0
+    while(currentDate < endDate):
+        nextDate = currentDate + oneDay
+        if(author == None):
+            c.execute("SELECT SUM(changes) FROM commits "
+                "WHERE time >= ? AND time < ?", 
+                (getTimestamp(currentDate), getTimestamp(nextDate)))
+        else:
+            c.execute("SELECT SUM(changes) FROM commits "
+                "WHERE time >= ? AND time < ? AND author = ?", 
+                (getTimestamp(currentDate), getTimestamp(nextDate), author))
+
+        # update the dated commit totals
+        for row in c:
+            if(row[0] != None):
+                changes += row[0]
+            rval[currentDate] = changes
+
+        currentDate += oneDay
+
+        # Reset the change counter at the beginning of the month
+        if(currentDate.month != currentMonth):
+            changes = 0
+            currentMonth = currentDate.month
+
+    return rval
+
+def generateJavaScriptData(cache, options):
     """
     Generates a set of Protovis JavaScript code that can be used to visualize
     overall developer throughput.
     """
     rval = ""
-    allCommits = {}
-    datedCommitTotals = {}
+    startDate = 0
+    endDate = 0
+    commitTotals = {}
+
+    # Get the minimum and maximum date in the database
+    c = cache.cursor()
+    c.execute("SELECT MIN(time), MAX(time) FROM commits")
+    minmaxdates = c.fetchone()
+    startDate = datetime.date.fromtimestamp(minmaxdates[0])
+    endDate = datetime.date.fromtimestamp(minmaxdates[1])
+
+    # Get all of the names to 
+    commitTotals["all"] = getCommitTotals(c, startDate, endDate)
     
-    for author in authors.keys():
-        for c in authors[author]:
-            # FIXME: This should be binned to a single work-day
-            commitArray = allCommits.get(c["time"], [])
-            commitArray.append(c)
-            allCommits[c["time"]] = commitArray
-
-    sortedDates = allCommits.keys()
-    sortedDates.sort()
-
-    for date in sortedDates:
-        for c in allCommits[date]:
-            datedCommitTotals[date] = datedCommitTotals.get(date, 0) + \
-                c["totalChanges"]
-
-    # Inject zero-ed commit totals at the beginning of each month
-    currentDate = datetime.date.fromtimestamp(sortedDates[0])
-    endDate = datetime.date.fromtimestamp(sortedDates[-1])
-    oneMonth = datetime.timedelta(weeks=4)
-    while(currentDate < endDate):
-        currentDate += oneMonth
-        secsInYear = 31556926
-        secsInMonth = 2629743
-        secondsSince1970 = (currentDate.year * secsInYear) + \
-            (currentDate.month * secsInMonth)
-        datedCommitTotals[secondsSince1970] = 0
+    names = getNames(cache)
+    for n in names:
+        formattedName = \
+            n.split("<")[0].strip().lower().replace(" ", "_").replace(".", "")
+        commitTotals[formattedName] = getCommitTotals(c, startDate, endDate, n)
 
     # Generate the JavaScript data file contents
-    rval = "var start = new Date(%s);\n" % (sortedDates[0] * 1000,)
-    rval += "var data = [\n"
-    modifiedLines = 0
-    currentTime = datetime.date.fromtimestamp(sortedDates[0])
-    for date in sortedDates:
-        commitTime = datetime.date.fromtimestamp(date)
-        
-        # Generate a saw-tooth area graph that resets the total number of
-        # lines modified after each month
-        if(currentTime.month != commitTime.month):
-            currentTime = commitTime
-            modifiedLines = 0
-        modifiedLines += datedCommitTotals[date]
-        rval += "   {x: %s, y: %s},\n" % (date * 1000, modifiedLines)
+    rval = "var start = new Date(%s);\n" % (getTimestamp(startDate) * 1000,)
+    rval += "var data = {\n"
 
-    rval += "];\n"
-    rval += "var end = new Date(%s);\n" % (sortedDates[-1] * 1000,)
-    
+    # Output key/value pair data for every committer
+    for n in commitTotals.keys():
+        rval += "   \"%s\": [\n" % (n,)
+        currentDate = startDate
+        oneDay = datetime.timedelta(1)
+        # Output the list of commits by the committer
+        while(currentDate < endDate):
+            rval += "      {x: %s, y: %s},\n" % \
+                (getTimestamp(currentDate) * 1000, commitTotals[n][currentDate])
+            currentDate += oneDay
+        rval += "   ],\n"
+    rval += "};\n"
+    rval += "var end = new Date(%s);\n" % (getTimestamp(endDate) * 1000,)
+
     return rval;
 
 def setupCache(options):
@@ -259,7 +296,7 @@ def setupCache(options):
 
     return sqlite3.connect(cacheFile)
 
-def processRevisions(author_map, repo, reponame, history, cache):
+def processRevisions(options, author_map, repo, reponame, history, cache):
     # process all of the commits reachable via git HEAD
     lastCommit = None
     for revision in history:
@@ -289,11 +326,14 @@ def processRevisions(author_map, repo, reponame, history, cache):
                 lkeys.remove("totalChanges")
                 for l in lkeys:
                     try:
+                        changes = commit[l]
+                        if(options.complexity.has_key(l)):
+                            changes = int(changes * options.complexity[l])
                         cache.execute("""INSERT INTO commits 
                             (id, repository, time, author, type, changes) 
                             VALUES (?, ?, ?, ?, ?, ?)""", 
                             (revision.id, reponame, commit["time"], 
-                            commit["author"], l, commit[l]))
+                            commit["author"], l, changes))
                         print reponame, commitTime, revision.id
                         cache.commit()
                     except sqlite3.IntegrityError:
@@ -324,7 +364,7 @@ def main():
         reponame = repository.split("/")[-1]
         repo = Repo(repository)
         history = repo.revision_history(repo.head())
-        processRevisions(author_map, repo, reponame, history, cache)
+        processRevisions(options, author_map, repo, reponame, history, cache)
 
     if(not options.out_dir):
         # if there isn't an output directory, dump some summary info to stdout
@@ -335,7 +375,7 @@ def main():
             print calculateOverallContributions(n, cache, options)
     else:
         # if an output directory exists, generate a web page
-        dataJavaScript = generateJavaScriptData(authors, options)
+        dataJavaScript = generateJavaScriptData(cache, options)
         dataFilename = os.path.join(options.out_dir, "data.js")
         
         # Create the web directory
