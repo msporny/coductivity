@@ -12,6 +12,7 @@ import os
 import os.path
 import subprocess
 import shutil
+import sqlite3
 import tempfile
 import time
 import datetime
@@ -36,27 +37,28 @@ def _get_options():
     parser = OptionParser(usage=USAGE)
     parser.add_option(
         "--cache-dir", action="store", default="/tmp/coductivity-cache",
-        help="The cache directory that will contain all git repositories " +
-        "being analyzed." 
-        "[Default: %default]")
+        help="The cache directory that will contain all git repositories "
+        "being analyzed. [Default: %default]")
+    parser.add_option(
+        "-c", "--cache-only", action="store_true", default=False,
+        help="Do not process any repositories and work directly from the " 
+        "cache. [Default: %default]")
     parser.add_option(
         "-l", "--language", action="append", default=
         ["c", "h", "i", "cpp", "js", "html", "tpl", "in", "ac", "py", "java", 
          "php", "inc"],
-        help="Add the language in the list of languages to summarize. " +
-        "This option may be used multiple times - for example, " +
-        "-l cpp -l h -l py"
-        "[Default: %default]")
+        help="Add the language in the list of languages to summarize. "
+        "This option may be used multiple times - for example, "
+        "-l cpp -l h -l py [Default: %default]")
     parser.add_option(
         "-o", "--out_dir", action="store", default=None,
-        help="If specified, creates a web-publishable directory containing " +
-        "the result of the coductivity run." 
-        "[Default: %default]")
+        help="If specified, creates a web-publishable directory containing "
+        "the result of the coductivity run. [Default: %default]")
     parser.add_option(
         "-a", "--author-map", action="store", default=None,
-        help="A colon-separated map of alias accounts to real accounts. " +
+        help="A colon-separated map of alias accounts to real accounts. "
         "The map can be used to assign multiple e-mail accounts to one account." 
-        "[Default: %default]")
+        " [Default: %default]")
     options, args = parser.parse_args()
     options.args = args
 
@@ -69,16 +71,29 @@ def getAuthorMap(options):
     multiple e-mail accounts to a single e-mail account.
     """
     rval = {}
-    
+
     if(os.path.exists(options.author_map)):
         authorFile = open(options.author_map, "r")
         for line in authorFile:
             (alias, email) = line.strip().split(":")
             rval[alias.strip()] = email.strip()
-        
+
     return rval
 
-def calculateOverallContributions(author, commitLog, options):
+def getNames(cache):
+    """
+    Gets a list of all names that are in the database.
+    """
+    rval = []
+    c = cache.cursor()
+    c.execute("SELECT DISTINCT author FROM commits")
+
+    for row in c:
+        rval.append(row[0])
+
+    return rval
+
+def calculateOverallContributions(author, cache, options):
     """
     Calculates the overall contributions made by the given committer and 
     generates a string that is easy to read.
@@ -87,14 +102,14 @@ def calculateOverallContributions(author, commitLog, options):
     languages = {}
     
     # process all of the commits, adding up the code line modification totals
-    for commit in commitLog:
-        lkeys = commit.keys()
-        lkeys.remove("author")
-        lkeys.remove("date")
-        lkeys.remove("totalChanges")
-        
-        for l in lkeys:
-            languages[l] = languages.get(l, 0) + commit[l]
+    # Get (language, changes) tuples from database for particular author
+    c = cache.cursor()
+    c.execute('SELECT type, changes FROM commits WHERE author=?', 
+        (author,))
+
+    # Add the changes to the languages list
+    for row in c:
+        languages[row[0]] = languages.get(row[0], 0) + row[1]
 
     rval = "Contributor: %s\n" % (author,)
 
@@ -176,9 +191,9 @@ def generateJavaScriptData(authors, options):
     for author in authors.keys():
         for c in authors[author]:
             # FIXME: This should be binned to a single work-day
-            commitArray = allCommits.get(c["date"], [])
+            commitArray = allCommits.get(c["time"], [])
             commitArray.append(c)
-            allCommits[c["date"]] = commitArray
+            allCommits[c["time"]] = commitArray
 
     sortedDates = allCommits.keys()
     sortedDates.sort()
@@ -221,6 +236,72 @@ def generateJavaScriptData(authors, options):
     
     return rval;
 
+def setupCache(options):
+    """
+    Ensures that the cache directory exists and that the cache database exists.
+    Returns an open connection to the database cache. Make sure to close the 
+    connection when you are done with it.
+    """
+    if(not os.path.isdir(options.cache_dir)):
+        os.makedirs(options.cache_dir)
+
+    cacheFile = os.path.join(options.cache_dir, "cache.db")
+    if(not os.path.exists(cacheFile)):
+        con = sqlite3.connect(cacheFile)
+        con.execute("""CREATE TABLE commits (id VARCHAR(42), 
+            repository VARCHAR(128), time DATETIME, author VARCHAR(128),
+            type VARCHAR(6), changes INTEGER)""")
+        con.execute("""CREATE UNIQUE INDEX commit_index ON commits 
+            (id, time, type)""")
+        con.execute("""CREATE INDEX authors_index ON commits (author)""")
+        con.commit()
+        con.close()
+
+    return sqlite3.connect(cacheFile)
+
+def processRevisions(author_map, repo, reponame, history, cache):
+    # process all of the commits reachable via git HEAD
+    lastCommit = None
+    for revision in history:
+        # map the aliases for the author correctly
+        author = revision.author
+        if(author_map.has_key(author)):
+            author = author_map[author]
+        
+        # create the new commit tracking object
+        commit = {"author": author}
+        commit["time"] = revision.commit_time
+        commit["totalChanges"] = 0
+
+        # dump a bit of status so that the developer knows that we're
+        # workin' it
+        commitTime = datetime.date.fromtimestamp(revision.commit_time)
+
+        if(lastCommit):
+            calculateDiff(repo, revision, commit, lastCommit)
+            # Do not add a commit that has more than 1000 total changes because
+            # it is most likely just a global search/replace for text
+            if(commit["totalChanges"] < 1000):
+                # Add the commit to the cache
+                lkeys = commit.keys()
+                lkeys.remove("author")
+                lkeys.remove("time")
+                lkeys.remove("totalChanges")
+                for l in lkeys:
+                    try:
+                        cache.execute("""INSERT INTO commits 
+                            (id, repository, time, author, type, changes) 
+                            VALUES (?, ?, ?, ?, ?, ?)""", 
+                            (revision.id, reponame, commit["time"], 
+                            commit["author"], l, commit[l]))
+                        print reponame, commitTime, revision.id
+                        cache.commit()
+                    except sqlite3.IntegrityError:
+                        #raise 
+                        return
+
+        lastCommit = revision
+
 def main():
     """
     The main entry point for the script.
@@ -228,12 +309,14 @@ def main():
     options = _get_options()
 
     # Check to make sure at least the project directory was specified
-    if(len(options.args) < 1):
+    if(len(options.args) < 1 and not options.cache_only):
         print "ERROR: You must specify at least one project directory."
         sys.exit(1)
 
     author_map = getAuthorMap(options)
-    authors = {}
+
+    # Create the coductivity cache directory and setup the cache database
+    cache = setupCache(options)
 
     # Assume each command-line parameter that is not an option is a path to
     # a git repository
@@ -241,45 +324,15 @@ def main():
         reponame = repository.split("/")[-1]
         repo = Repo(repository)
         history = repo.revision_history(repo.head())
-
-        # process all of the commits reachable via git HEAD
-        lastCommit = None
-        for revision in history:
-            # map the aliases for the author correctly
-            author = revision.author
-            if(author_map.has_key(author)):
-                author = author_map[author]
-            
-            # retrieve the coductivity commit list, or create a new one
-            authors[author] = authors.get(author, [])
-            
-            # create the new commit tracking object
-            commit = {"author": author}
-            commit["date"] = revision.commit_time
-            commit["totalChanges"] = 0
-
-            # dump a bit of status so that the developer knows that we're
-            # workin' it
-            commitTime = datetime.date.fromtimestamp(revision.commit_time)
-            print reponame, commitTime, revision.id
-
-            if(lastCommit):
-                calculateDiff(repo, revision, commit, lastCommit)
-                # Do not add a commit that has more than 1000 total changes because
-                # it is most likely just a global search/replace for text
-                if(commit["totalChanges"] < 1000):
-                    authors[author].append(commit)
-            lastCommit = revision
+        processRevisions(author_map, repo, reponame, history, cache)
 
     if(not options.out_dir):
         # if there isn't an output directory, dump some summary info to stdout
-        names = authors.keys()
-        def sorter(a, b):
-            return cmp(authors[b], authors[a])
-        names.sort(sorter)
+        names = getNames(cache)
+        names.sort()
 
         for n in names:
-            print calculateOverallContributions(n, authors[n], options)
+            print calculateOverallContributions(n, cache, options)
     else:
         # if an output directory exists, generate a web page
         dataJavaScript = generateJavaScriptData(authors, options)
@@ -294,7 +347,7 @@ def main():
             "protovis-r3.2.js"]
 
         for f in files:
-            shutil.copyfile(os.path.join("web", f), 
+            shutil.copyfile(os.path.join("web", f),
                 os.path.join(options.out_dir, f))
 
         data = open(dataFilename, "w")
