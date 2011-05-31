@@ -7,12 +7,13 @@ determine whether or not a company or individual is being productive - code
 output is just one small measure of a person's influence on the whole health
 of a project.
 """
-import sys
+import re
 import os
 import os.path
 import subprocess
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 import datetime
@@ -63,8 +64,9 @@ def _get_options():
     options.args = args
 
     options.complexity = {"c": 1.0, "h": 0.8, "i": 1.2, "cpp": 1.0, 
-       "js": 0.8, "html": 0.4, "css": 0.8, "tpl": 0.5, "in": 1.2, "ac": 1.2, 
-       "py": 0.8, "java": 0.9, "php": 0.8, "inc": 0.8}
+       "js": 0.8, "html": 0.6, "css": 1.0, "tpl": 0.7, "in": 1.2, "ac": 1.2, 
+       "py": 0.8, "java": 0.9, "php": 0.8, "inc": 0.8, "config": 0.3,
+       "json": 0.3}
     #options.complexity = {"c": 1.0, "h": 1.0, "i": 1.0, "cpp": 1.0, 
     #   "js": 1.0, "html": 1.0, "tpl": 1.0, "css": 1.0, "in": 1.0, "ac": 1.0, 
     #   "py": 1.0, "java": 1.0, "php": 1.0, "inc": 1.0}
@@ -79,7 +81,7 @@ def getAuthorMap(options):
     """
     rval = {}
 
-    if(os.path.exists(options.author_map)):
+    if(options.author_map and os.path.exists(options.author_map)):
         authorFile = open(options.author_map, "r")
         for line in authorFile:
             (alias, email) = line.strip().split(":")
@@ -87,7 +89,7 @@ def getAuthorMap(options):
 
     return rval
 
-def getNames(cache):
+def getNames(cache, author_map):
     """
     Gets a list of all names that are in the database.
     """
@@ -98,21 +100,33 @@ def getNames(cache):
     for row in c:
         rval.append(row[0])
 
+    # Remove the names that have mappings in the author map
+    for k, v in author_map.items():
+        if(k in rval):
+            rval.remove(k)
+
     return rval
 
-def calculateOverallContributions(author, cache, options):
+def calculateOverallContributions(author, author_map, cache, options):
     """
     Calculates the overall contributions made by the given committer and 
     generates a string that is easy to read.
     """
     rval = ""
     languages = {}
-    
+    aliases = [author]
+
+    # Get all of the aliases for this author
+    for k, v in author_map.items():
+        if(v == author):
+            aliases.append(v)
+
     # process all of the commits, adding up the code line modification totals
     # Get (language, changes) tuples from database for particular author
     c = cache.cursor()
-    c.execute('SELECT type, changes FROM commits WHERE author=?', 
-        (author,))
+    qlist = "(" + ",".join(["?" for x in range(0, len(aliases))]) + ")"
+    c.execute('SELECT type, changes FROM commits WHERE author IN ' + qlist, 
+        aliases)
 
     # Add the changes to the languages list
     for row in c:
@@ -125,10 +139,15 @@ def calculateOverallContributions(author, cache, options):
     if(len(options.language) > 0):
         lkeys = options.language
 
-    # gather all of the languages that have been marked as being important        
+    # gather all of the languages that have been marked as being important
+    total = 0
     for k in lkeys:
         if(k in languages.keys()):
-            rval += "    %s: %i\n" % (k, languages[k])
+            esloc = languages[k] * options.complexity[k]
+            rval += "    %s: %i (effort), %i (SLOC)\n" % \
+                (k, esloc, languages[k])
+            total += esloc
+    rval += "    Total: %i (effort)\n" % (total,)
 
     return rval
 
@@ -146,16 +165,19 @@ def calculateDiff(repo, revision, commit, lastCommit):
     # Keep track of the active file type and whether or not
     # changes should be ignored
     activeFileType = None
+    ignoreFile = False
     ignoreLine = False
     
     # This loop does several things - it attempts to identify the
     # file type by the extension, counts file modifications,
     # and ignores files that are deleted. These stats are captured
     # in a commit object and added to the author dictionary
+    whitespaceStringRe = re.compile("\s")
     for line in diff:
         # determine the active file type and whether or not the
         # line should be ignored
-        if(line.startswith("---")):
+        if(line.startswith("--- ")):
+            ignoreLine = True
             if(line.startswith("--- /dev/null")):
                 activeFileType = None
             else:
@@ -164,27 +186,37 @@ def calculateDiff(repo, revision, commit, lastCommit):
                     print "WARNING: Ignoring unknown file type %s" % \
                         (activeFileType,)
                     activeFileType = None
-                    ignoreLine = True
-            ignoreLine = False
-        elif(line.startswith("---")):
+                    ignoreFile = True
+            ignoreFile = False
+        elif(line.startswith("+++ ")):
+            ignoreLine = True
             if(line.startswith("+++ /dev/null")):
                 # don't count file deletions as modified lines
-                ignoreLine = True
+                ignoreFile = True
             elif(not activeFileType):
                 activeFileType = line.split(".")[-1].strip()
                 if(activeFileType.startswith("---")):
                     print "WARNING: Ignoring unknown file type %s" % \
                         (activeFileType,)
                     activeFileType = None
-                    ignoreLine = True
+                    ignoreFile = True
+
+        # Ignore lines that are just whitespace or parenthesis
+        cleanedLine = re.sub(whitespaceStringRe, "", line)
+        if(ignoreLine == False and len(cleanedLine) < 4):
+            ignoreLine = True
 
         # Record the modification if there is an active file type
         # and the line should not be ignored, and the line starts
         # with a '+' or a '-'
-        if(activeFileType and not ignoreLine and 
+        if(activeFileType and not ignoreFile and not ignoreLine and 
             (line.startswith("-") or line.startswith("+"))):
+            #print "    Counting:", line.strip()[:60]
             commit[activeFileType] = commit.get(activeFileType, 0) + 1
             commit["totalChanges"] = commit.get("totalChanges", 0) + 1
+        else:
+            #print "___IGNOR:", line.strip()
+            ignoreLine = False
 
 def getTimestamp(dt):
     """
@@ -247,7 +279,7 @@ def generateJavaScriptData(cache, options):
     # Get all of the names to 
     commitTotals["all"] = getCommitTotals(c, startDate, endDate)
     
-    names = getNames(cache)
+    names = getNames(cache, author_map)
     for n in names:
         formattedName = \
             n.split("<")[0].strip().lower().replace(" ", "_").replace(".", "")
@@ -318,7 +350,7 @@ def processRevisions(options, author_map, repo, reponame, history, cache):
             calculateDiff(repo, revision, commit, lastCommit)
             # Do not add a commit that has more than 1000 total changes because
             # it is most likely just a global search/replace for text
-            if(commit["totalChanges"] < 1000):
+            if(commit["totalChanges"] < 750):
                 # Add the commit to the cache
                 lkeys = commit.keys()
                 lkeys.remove("author")
@@ -327,18 +359,24 @@ def processRevisions(options, author_map, repo, reponame, history, cache):
                 for l in lkeys:
                     try:
                         changes = commit[l]
-                        if(options.complexity.has_key(l)):
-                            changes = int(changes * options.complexity[l])
                         cache.execute("""INSERT INTO commits 
                             (id, repository, time, author, type, changes) 
                             VALUES (?, ?, ?, ?, ?, ?)""", 
                             (revision.id, reponame, commit["time"], 
                             commit["author"], l, changes))
-                        print reponame, commitTime, revision.id
+                        print reponame, commitTime, commit["author"], changes, revision.id
                         cache.commit()
                     except sqlite3.IntegrityError:
-                        #raise 
                         return
+                    except sqlite3.ProgrammingError:
+                        print "ERROR: INSERT INTO commits " + \
+                            "(id, repository, time, author, type, changes) " + \
+                            "VALUES (%s, %s, %s, %s, %s, %s)" % \
+                            (revision.id, reponame, commit["time"],
+                            commit["author"], l, changes)
+                        return
+            else:
+                print "WARNING: Ignoring bulk edit on ", reponame, commit["author"], commit["totalChanges"]
 
         lastCommit = revision
 
@@ -350,7 +388,8 @@ def main():
 
     # Check to make sure at least the project directory was specified
     if(len(options.args) < 1 and not options.cache_only):
-        print "ERROR: You must specify at least one project directory."
+        print "ERROR: You must specify at least one project directory " + \
+            "or specify --cache-only."
         sys.exit(1)
 
     author_map = getAuthorMap(options)
@@ -368,11 +407,11 @@ def main():
 
     if(not options.out_dir):
         # if there isn't an output directory, dump some summary info to stdout
-        names = getNames(cache)
+        names = getNames(cache, author_map)
         names.sort()
 
         for n in names:
-            print calculateOverallContributions(n, cache, options)
+            print calculateOverallContributions(n, author_map, cache, options)
     else:
         # if an output directory exists, generate a web page
         dataJavaScript = generateJavaScriptData(cache, options)
